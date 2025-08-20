@@ -1,0 +1,103 @@
+name: CI/CD to Amazon ECR and ECS
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPOSITORY: aicp-claims-api-container
+  CLUSTER_NAME: aicp-ecs-cluster
+  SERVICE_NAME: aicp-claims-api-task-service-m7a6lold
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push image (latest + sha)
+        env:
+          ECR_REGISTRY: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          IMAGE_LATEST: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+          IMAGE_SHA: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker build -t "$IMAGE_LATEST" -t "$IMAGE_SHA" .
+          docker push "$IMAGE_LATEST"
+          docker push "$IMAGE_SHA"
+          echo "IMAGE_URI=$IMAGE_LATEST" >> $GITHUB_ENV
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Render task definition with latest image + Redshift envs
+        run: |
+          # Avoid logging secrets
+          echo "::add-mask::${{ secrets.REDSHIFT_PASSWORD }}"
+
+          # Replace IMAGE placeholder, then inject env vars
+          jq \
+          --arg image "${{ env.IMAGE_URI }}" \
+          --arg host  "${{ secrets.REDSHIFT_HOST }}" \
+          --arg db    "${{ secrets.REDSHIFT_DB }}" \
+          --arg user  "${{ secrets.REDSHIFT_USER }}" \
+          --arg pwd   "${{ secrets.REDSHIFT_PASSWORD }}" \
+          --arg port  "${{ secrets.REDSHIFT_PORT }}" '
+            .containerDefinitions[0].image = $image
+            | .containerDefinitions[0].environment += [
+                { "name":"REDSHIFT_HOST",     "value": $host },
+                { "name":"REDSHIFT_DB",       "value": $db },
+                { "name":"REDSHIFT_USER",     "value": $user },
+                { "name":"REDSHIFT_PASSWORD", "value": $pwd },
+                { "name":"REDSHIFT_PORT",     "value": ($port // "5439") }
+              ]
+          ' ecs-task-definition.json > ecs-task-def.rendered.json
+
+      - name: Register task definition
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://ecs-task-def.rendered.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+          echo "Registered: $TASK_DEF_ARN"
+
+      - name: Deploy to ECS (force new deployment)
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.CLUSTER_NAME }}" \
+            --service "${{ env.SERVICE_NAME }}" \
+            --task-definition "${{ env.TASK_DEF_ARN }}" \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Send Email Notification
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: GitHub Actions CI/CD - ${{ job.status }}
+          to: mm.cloudenginner@gmail.com
+          from: ${{ secrets.EMAIL_USERNAME }}
+          body: |
+            The CI/CD pipeline for your AICP Claims API has completed.
+            Status: ${{ job.status }}
+            Image:  ${{ env.IMAGE_URI }}
+            Task:   ${{ env.TASK_DEF_ARN }}
