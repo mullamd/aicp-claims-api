@@ -17,6 +17,7 @@ env:
 jobs:
   build-push-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,36 +43,40 @@ jobs:
           docker push "$IMAGE_SHA"
           echo "IMAGE_URI=$IMAGE_LATEST" >> $GITHUB_ENV
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Ensure CloudWatch log group exists (optional)
+        run: aws logs create-log-group --log-group-name /ecs/aicp-claims-api || true
 
-      - name: Render task definition with latest image + Redshift envs
+      # Compute a default port if secret not set
+      - name: Set default Redshift port
+        shell: bash
         run: |
-          # Avoid logging secrets
-          echo "::add-mask::${{ secrets.REDSHIFT_PASSWORD }}"
+          if [ -z "${{ secrets.REDSHIFT_PORT }}" ]; then
+            echo "RS_PORT=5439" >> $GITHUB_ENV
+          else
+            echo "RS_PORT=${{ secrets.REDSHIFT_PORT }}" >> $GITHUB_ENV
+          fi
 
-          # Replace IMAGE placeholder, then inject env vars
-          jq \
-          --arg image "${{ env.IMAGE_URI }}" \
-          --arg host  "${{ secrets.REDSHIFT_HOST }}" \
-          --arg db    "${{ secrets.REDSHIFT_DB }}" \
-          --arg user  "${{ secrets.REDSHIFT_USER }}" \
-          --arg pwd   "${{ secrets.REDSHIFT_PASSWORD }}" \
-          --arg port  "${{ secrets.REDSHIFT_PORT }}" '
-            .containerDefinitions[0].image = $image
-            | .containerDefinitions[0].environment += [
-                { "name":"REDSHIFT_HOST",     "value": $host },
-                { "name":"REDSHIFT_DB",       "value": $db },
-                { "name":"REDSHIFT_USER",     "value": $user },
-                { "name":"REDSHIFT_PASSWORD", "value": $pwd },
-                { "name":"REDSHIFT_PORT",     "value": ($port // "5439") }
-              ]
-          ' ecs-task-definition.json > ecs-task-def.rendered.json
+      # ✅ Official renderer (no jq/CRLF headaches)
+      - name: Render Amazon ECS task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ecs-task-definition.json
+          container-name: aicp-claims-api
+          image: ${{ env.IMAGE_URI }}
+          environment-variables: |
+            REDSHIFT_HOST=${{ secrets.REDSHIFT_HOST }}
+            REDSHIFT_DB=${{ secrets.REDSHIFT_DB }}
+            REDSHIFT_USER=${{ secrets.REDSHIFT_USER }}
+            REDSHIFT_PASSWORD=${{ secrets.REDSHIFT_PASSWORD }}
+            REDSHIFT_PORT=${{ env.RS_PORT }}
 
       - name: Register task definition
+        env:
+          RENDERED: ${{ steps.render.outputs.task-definition }}
         run: |
           TASK_DEF_ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://ecs-task-def.rendered.json \
+            --cli-input-json file://$RENDERED \
             --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
           echo "Registered: $TASK_DEF_ARN"
@@ -87,12 +92,14 @@ jobs:
 
       - name: Send Email Notification
         if: always()
+        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
           server_port: 465
+          secure: true
           username: ${{ secrets.EMAIL_USERNAME }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
+          password: ${{ secrets.EMAIL_PASSWORD }}   # Gmail App Password
           subject: GitHub Actions CI/CD - ${{ job.status }}
           to: mm.cloudenginner@gmail.com
           from: ${{ secrets.EMAIL_USERNAME }}
