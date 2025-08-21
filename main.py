@@ -24,7 +24,8 @@ def get_connection():
     if not all([host, user, pwd, db, port]):
         raise RuntimeError("Missing Redshift connection environment variables")
 
-    return psycopg2.connect(
+    # Tip: statement timeout prevents long-hanging queries if desired
+    conn = psycopg2.connect(
         host=host,
         user=user,
         password=pwd,
@@ -32,11 +33,15 @@ def get_connection():
         port=port,
         sslmode="require",
         connect_timeout=10,
-        application_name="aicp-claims-api"
+        application_name="aicp-claims-api",
     )
+    # Optional: shorten runaway queries (uncomment if you want)
+    # with conn.cursor() as c:
+    #     c.execute("SET statement_timeout = 5000")  # 5 seconds
+    return conn
 
 # -----------------------------
-# Health
+# Health Check
 # -----------------------------
 @app.get("/health")
 def health():
@@ -46,6 +51,8 @@ def health():
             cur.fetchone()
         return {"status": "ok", "db": "ok"}
     except Exception as e:
+        # If you want ECS to mark task unhealthy on DB errors, uncomment next line:
+        # raise HTTPException(status_code=503, detail=f"DB error: {e}")
         return {"status": "ok", "db": f"error: {e}"}
 
 # -----------------------------
@@ -56,8 +63,8 @@ def health():
 def get_claim_status_and_ai(claim_id: str):
     """
     Returns status + AI fields for a single claim.
-    Expects table: dev.aicp_insurance.claims_processed
-      columns: claim_id, claim_status, fraud_prediction, fraud_score, fraud_explanation
+    Expects table: aicp_insurance.claims_processed
+      columns: claim_id, claim_status, fraud_prediction, fraud_score, fraud_explanation, inserted_at
     """
     sql = """
       SELECT
@@ -66,7 +73,7 @@ def get_claim_status_and_ai(claim_id: str):
           fraud_prediction,
           fraud_score,
           fraud_explanation
-      FROM dev.aicp_insurance.claims_processed
+      FROM aicp_insurance.claims_processed
       WHERE claim_id = %s
       ORDER BY inserted_at DESC
       LIMIT 1;
@@ -106,12 +113,12 @@ def list_claim_ids_by_status(
     """
     Returns a list of claim_ids with the given status in the last `days` days,
     ordered by most recent.
-    Expects column 'inserted_at' in dev.aicp_insurance.claims_processed.
+    Expects column 'inserted_at' in aicp_insurance.claims_processed.
     Matching is normalized on both sides (remove non-alphanumerics, lowercase).
     """
     sql = """
       SELECT claim_id
-      FROM dev.aicp_insurance.claims_processed
+      FROM aicp_insurance.claims_processed
       WHERE LOWER(REGEXP_REPLACE(claim_status, '[^a-z0-9]+', '')) =
             LOWER(REGEXP_REPLACE(%s,          '[^a-z0-9]+', ''))
         AND inserted_at >= DATEADD(day, -%s, GETDATE())
