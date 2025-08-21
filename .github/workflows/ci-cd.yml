@@ -12,7 +12,7 @@ env:
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
   ECR_REPOSITORY: aicp-claims-api-container
   CLUSTER_NAME: aicp-ecs-cluster
-  SERVICE_NAME: aicp-claims-api-task-service-m7a6lold
+  SERVICE_NAME: aicp-claims-api-task-service-mlze3tbu
 
 jobs:
   build-push-deploy:

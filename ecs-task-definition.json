@@ -15,7 +15,7 @@
       "image": "IMAGE_URI_PLACEHOLDER",
       "essential": true,
       "portMappings": [
-        { "containerPort": 8000, "protocol": "tcp" }
+        { "containerPort": 80, "protocol": "tcp" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -27,10 +27,7 @@
       },
       "environment": [],
       "healthCheck": {
-        "command": [
-          "CMD-SHELL",
-          "curl -fsS http://localhost:8000/health || exit 1"
-        ],
+        "command": ["CMD-SHELL", "curl -fsS http://localhost:80/health || exit 1"],
         "interval": 30,
         "timeout": 5,
         "retries": 3,
